@@ -13,7 +13,7 @@ if (!defined('awsAccessKey')) define('awsAccessKey', 'change-this');
 if (!defined('awsSecretKey')) define('awsSecretKey', 'change-this');
 
 // Check for CURL
-if (!extension_loaded('curl') && !@dl(PHP_SHLIB_SUFFIX == 'so' ? 'curl.so' : 'php_curl.dll'))
+if (!extension_loaded('curl'))
 	exit("\nERROR: CURL extension not loaded\n\n");
 
 // Pointless without your keys!
@@ -146,20 +146,17 @@ final class S3Wrapper extends S3 {
                     $this->position = $offset;
                     return true;
                 } else return false;
-            break;
             case SEEK_CUR:
                 if ($offset >= 0) {
                     $this->position += $offset;
                     return true;
                 } else return false;
-            break;
             case SEEK_END:
                 $bytes = strlen($this->buffer->body);
                 if ($bytes + $offset >= 0) {
                     $this->position = $bytes + $offset;
                     return true;
                 } else return false;
-            break;
             default: return false;
         }
     }
