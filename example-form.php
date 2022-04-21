@@ -12,7 +12,7 @@ if (!defined('awsAccessKey')) define('awsAccessKey', 'change-this');
 if (!defined('awsSecretKey')) define('awsSecretKey', 'change-this');
 
 // Check for CURL
-if (!extension_loaded('curl') && !@dl(PHP_SHLIB_SUFFIX == 'so' ? 'curl.so' : 'php_curl.dll'))
+if (!extension_loaded('curl'))
 	exit("\nERROR: CURL extension not loaded\n\n");
 
 // Pointless without your keys!
