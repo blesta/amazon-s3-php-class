@@ -191,6 +191,16 @@ class S3
 	private static $__signingKeyResource = false;
 
 
+    /**
+     * CURL progress function callback
+     *
+     * @var function
+     * @access public
+     * @static
+     */
+    public static $progressFunction = null;
+
+
 	/**
 	* Constructor - if you're not using the class statically
 	*
@@ -353,6 +363,18 @@ class S3
 	{
 		if (self::$__signingKeyResource !== false)
 			openssl_free_key(self::$__signingKeyResource);
+	}
+
+
+    /**
+	* Set progress function
+	*
+	* @param function $func Progress function
+	* @return void
+	*/
+	public static function setProgressFunction($func = null)
+	{
+		self::$progressFunction = $func;
 	}
 
 
@@ -520,7 +542,7 @@ class S3
 		$rest = new S3Request('PUT', $bucket, '', self::$endpoint);
 		$rest->setAmzHeader('x-amz-acl', $acl);
 
-		if ($location !== false)
+        if ($location !== false)
 		{
 			$dom = new DOMDocument;
 			$createBucketConfiguration = $dom->createElement('CreateBucketConfiguration');
@@ -583,8 +605,8 @@ class S3
 		}
 		clearstatcache(false, $file);
 		return array('file' => $file, 'size' => filesize($file), 'md5sum' => $md5sum !== false ?
-		(is_string($md5sum) ? $md5sum : base64_encode(md5_file($file, true))) : '');
-	}
+        (is_string($md5sum) ? $md5sum : base64_encode(md5_file($file, true))) : '', 'sha256sum' => hash_file('sha256', $file));
+    }
 
 
 	/**
@@ -640,7 +662,8 @@ class S3
 
 		if (!is_array($input)) $input = array(
 			'data' => $input, 'size' => strlen($input),
-			'md5sum' => base64_encode(md5($input, true))
+			'md5sum' => base64_encode(md5($input, true)),
+            'sha256sum' => hash('sha256', $input)
 		);
 
 		// Data
@@ -692,6 +715,8 @@ class S3
 		{
 			$rest->setHeader('Content-Type', $input['type']);
 			if (isset($input['md5sum'])) $rest->setHeader('Content-MD5', $input['md5sum']);
+
+            if (isset($input['sha256sum'])) $rest->setAmzHeader('x-amz-content-sha256', $input['sha256sum']);
 
 			$rest->setAmzHeader('x-amz-acl', $acl);
 			foreach ($metaHeaders as $h => $v) $rest->setAmzHeader('x-amz-meta-'.$h, $v);
@@ -1708,11 +1733,13 @@ class S3
 		if ($comment !== '') $distributionConfig->appendChild($dom->createElement('Comment', $comment));
 		$distributionConfig->appendChild($dom->createElement('Enabled', $enabled ? 'true' : 'false'));
 
-		$trusted = $dom->createElement('TrustedSigners');
-		foreach ($trustedSigners as $id => $type)
-			$trusted->appendChild($id !== '' ? $dom->createElement($type, $id) : $dom->createElement($type));
-		$distributionConfig->appendChild($trusted);
-
+        if (!empty($trustedSigners))
+        {
+            $trusted = $dom->createElement('TrustedSigners');
+            foreach ($trustedSigners as $id => $type)
+                $trusted->appendChild($id !== '' ? $dom->createElement($type, $id) : $dom->createElement($type));
+            $distributionConfig->appendChild($trusted);
+        }
 		$dom->appendChild($distributionConfig);
 		//var_dump($dom->saveXML());
 		return $dom->saveXML();
@@ -1906,6 +1933,118 @@ class S3
 		pack('H*', sha1((str_pad(self::$__secretKey, 64, chr(0x00)) ^
 		(str_repeat(chr(0x36), 64))) . $string)))));
 	}
+
+    /**
+	* Generate the headers for AWS Signature V4
+	*
+	* @internal Used by S3Request::getResponse()
+	* @param array $amzHeaders
+	* @param array $headers
+	* @param string $method
+	* @param string $uri
+	* @param array $parameters
+	* @return array
+	*/
+	public static function __getSignatureV4($amzHeaders, $headers, $method, $uri, $parameters)
+	{
+		$service = 's3';
+
+        // Fetch region
+        $region = null;
+        if (method_exists(self::class, 'getRegion')) {
+            $region = S3::getRegion();
+        }
+        if (empty($region) && !empty(self::$region)) {
+            $region = self::$region;
+        }
+        if (empty($region)) {
+            if (preg_match("/s3[.-](?:website-|dualstack\.)?(.+)\.amazonaws\.com/i", self::$endpoint, $match) !== 0
+                && strtolower($match[1]) !== "external-1")
+            {
+                $region = $match[1];
+            }
+        }
+
+		$algorithm = 'AWS4-HMAC-SHA256';
+		$combinedHeaders = array();
+
+		$amzDateStamp = substr($amzHeaders['x-amz-date'], 0, 8);
+
+		// CanonicalHeaders
+		foreach ($headers as $k => $v)
+			$combinedHeaders[strtolower($k)] = trim($v);
+		foreach ($amzHeaders as $k => $v)
+			$combinedHeaders[strtolower($k)] = trim($v);
+		uksort($combinedHeaders, array(self::class, '__sortMetaHeadersCmp'));
+
+		// Convert null query string parameters to strings and sort
+		$parameters = array_map('strval', $parameters);
+		uksort($parameters, array(self::class, '__sortMetaHeadersCmp'));
+		$queryString = http_build_query($parameters, null, '&', PHP_QUERY_RFC3986);
+
+		// Payload
+		$amzPayload = array($method);
+
+		$qsPos = strpos($uri, '?');
+		$amzPayload[] = ($qsPos === false ? $uri : substr($uri, 0, $qsPos));
+
+		$amzPayload[] = $queryString;
+		// add header as string to requests
+		foreach ($combinedHeaders as $k => $v )
+		{
+			$amzPayload[] = $k . ':' . $v;
+		}
+		// add a blank entry so we end up with an extra line break
+		$amzPayload[] = '';
+		// SignedHeaders
+		$amzPayload[] = implode(';', array_keys($combinedHeaders));
+		// payload hash
+		$amzPayload[] = $amzHeaders['x-amz-content-sha256'];
+		// request as string
+		$amzPayloadStr = implode("\n", $amzPayload);
+
+		// CredentialScope
+		$credentialScope = array($amzDateStamp, $region, $service, 'aws4_request');
+
+		// stringToSign
+		$stringToSignStr = implode("\n", array($algorithm, $amzHeaders['x-amz-date'],
+		implode('/', $credentialScope), hash('sha256', $amzPayloadStr)));
+
+		// Make Signature
+		$kSecret = 'AWS4' . self::$__secretKey;
+		$kDate = hash_hmac('sha256', $amzDateStamp, $kSecret, true);
+		$kRegion = hash_hmac('sha256', $region, $kDate, true);
+		$kService = hash_hmac('sha256', $service, $kRegion, true);
+		$kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+
+		$signature = hash_hmac('sha256', $stringToSignStr, $kSigning);
+
+		return $algorithm . ' ' . implode(',', array(
+			'Credential=' . self::$__accessKey . '/' . implode('/', $credentialScope),
+			'SignedHeaders=' . implode(';', array_keys($combinedHeaders)),
+			'Signature=' . $signature,
+		));
+	}
+
+
+    /**
+     * Sort compare for meta headers
+     *
+     * @internal Used to sort x-amz meta headers
+     * @param string $a String A
+     * @param string $b String B
+     * @return integer
+     */
+    private static function __sortMetaHeadersCmp($a, $b)
+    {
+        $lenA = strlen($a);
+        $lenB = strlen($b);
+        $minLen = min($lenA, $lenB);
+        $ncmp = strncmp($a, $b, $minLen);
+        if ($lenA == $lenB) return $ncmp;
+        if (0 == $ncmp) return $lenA < $lenB ? -1 : 1;
+        return $ncmp;
+    }
 
 }
 
@@ -2167,42 +2306,46 @@ final class S3Request
 		}
 
 		// Headers
-		$headers = array(); $amz = array();
-		foreach ($this->amzHeaders as $header => $value)
-			if (strlen($value) > 0) $headers[] = $header.': '.$value;
-		foreach ($this->headers as $header => $value)
-			if (strlen($value) > 0) $headers[] = $header.': '.$value;
+        $httpHeaders = array();
+        if (S3::hasAuth())
+        {
+            // Authorization string (CloudFront stringToSign should only contain a date)
+            if ($this->headers['Host'] == 'cloudfront.amazonaws.com')
+            {
+                # TODO: Update CloudFront authentication
+                foreach ($this->amzHeaders as $header => $value)
+                    if (strlen($value) > 0) $httpHeaders[] = $header.': '.$value;
 
-		// Collect AMZ headers for signature
-		foreach ($this->amzHeaders as $header => $value)
-			if (strlen($value) > 0) $amz[] = strtolower($header).':'.$value;
+                foreach ($this->headers as $header => $value)
+                    if (strlen($value) > 0) $httpHeaders[] = $header.': '.$value;
 
-		// AMZ headers must be sorted
-		if (sizeof($amz) > 0)
-		{
-			//sort($amz);
-			usort($amz, array(&$this, '__sortMetaHeadersCmp'));
-			$amz = "\n".implode("\n", $amz);
-		} else $amz = '';
+                $httpHeaders[] = 'Authorization: ' . S3::__getSignature($this->headers['Date']);
+            }
+            else
+            {
+                $this->amzHeaders['x-amz-date'] = gmdate('Ymd\THis\Z');
 
-		if (S3::hasAuth())
-		{
-			// Authorization string (CloudFront stringToSign should only contain a date)
-			if ($this->headers['Host'] == 'cloudfront.amazonaws.com')
-				$headers[] = 'Authorization: ' . S3::__getSignature($this->headers['Date']);
-			else
-			{
-				$headers[] = 'Authorization: ' . S3::__getSignature(
-					$this->verb."\n".
-					$this->headers['Content-MD5']."\n".
-					$this->headers['Content-Type']."\n".
-					$this->headers['Date'].$amz."\n".
-					$this->resource
-				);
-			}
-		}
+                if (!isset($this->amzHeaders['x-amz-content-sha256']))
+                    $this->amzHeaders['x-amz-content-sha256'] = hash('sha256', $this->data);
 
-		curl_setopt($curl, CURLOPT_HTTPHEADER, $headers);
+                foreach ($this->amzHeaders as $header => $value)
+                    if (strlen($value) > 0) $httpHeaders[] = $header.': '.$value;
+
+                foreach ($this->headers as $header => $value)
+                    if (strlen($value) > 0) $httpHeaders[] = $header.': '.$value;
+
+                $httpHeaders[] = 'Authorization: ' . S3::__getSignatureV4(
+                        $this->amzHeaders,
+                        $this->headers,
+                        $this->verb,
+                        $this->uri,
+                        $this->parameters
+                    );
+
+            }
+        }
+
+		curl_setopt($curl, CURLOPT_HTTPHEADER, $httpHeaders);
 		curl_setopt($curl, CURLOPT_HEADER, false);
 		curl_setopt($curl, CURLOPT_RETURNTRANSFER, false);
 		curl_setopt($curl, CURLOPT_WRITEFUNCTION, array(&$this, '__responseWriteCallback'));
@@ -2238,6 +2381,12 @@ final class S3Request
 			break;
 			default: break;
 		}
+
+        // set curl progress function callback
+        if (S3::$progressFunction) {
+            curl_setopt($curl, CURLOPT_NOPROGRESS, false);
+            curl_setopt($curl, CURLOPT_PROGRESSFUNCTION, S3::$progressFunction);
+        }
 
 		// Execute, grab errors
 		if (curl_exec($curl))
@@ -2278,32 +2427,13 @@ final class S3Request
 	}
 
 	/**
-	* Sort compare for meta headers
-	*
-	* @internal Used to sort x-amz meta headers
-	* @param string $a String A
-	* @param string $b String B
-	* @return integer
-	*/
-	private function __sortMetaHeadersCmp($a, $b)
-	{
-		$lenA = strpos($a, ':');
-		$lenB = strpos($b, ':');
-		$minLen = min($lenA, $lenB);
-		$ncmp = strncmp($a, $b, $minLen);
-		if ($lenA == $lenB) return $ncmp;
-		if (0 == $ncmp) return $lenA < $lenB ? -1 : 1;
-		return $ncmp;
-	}
-
-	/**
 	* CURL write callback
 	*
-	* @param resource &$curl CURL resource
-	* @param string &$data Data
+	* @param resource $curl CURL resource
+	* @param string $data Data
 	* @return integer
 	*/
-	private function __responseWriteCallback(&$curl, &$data)
+	private function __responseWriteCallback($curl, $data)
 	{
 		if (in_array($this->response->code, array(200, 206)) && $this->fp !== false)
 			return fwrite($this->fp, $data);
@@ -2340,28 +2470,29 @@ final class S3Request
 	*/
 	private function __responseHeaderCallback($curl, $data)
 	{
-		if (($strlen = strlen($data)) <= 2) return $strlen;
-		if (substr($data, 0, 4) == 'HTTP')
-			$this->response->code = (int)substr($data, 9, 3);
-		else
-		{
-			$data = trim($data);
-			if (strpos($data, ': ') === false) return $strlen;
-			list($header, $value) = explode(': ', $data, 2);
-			if ($header == 'Last-Modified')
-				$this->response->headers['time'] = strtotime($value);
-			elseif ($header == 'Date')
-				$this->response->headers['date'] = strtotime($value);
-			elseif ($header == 'Content-Length')
-				$this->response->headers['size'] = (int)$value;
-			elseif ($header == 'Content-Type')
-				$this->response->headers['type'] = $value;
-			elseif ($header == 'ETag')
-				$this->response->headers['hash'] = $value[0] == '"' ? substr($value, 1, -1) : $value;
-			elseif (preg_match('/^x-amz-meta-.*$/', $header))
-				$this->response->headers[$header] = $value;
-		}
-		return $strlen;
+        if (($strlen = strlen($data)) <= 2) return $strlen;
+        if (substr($data, 0, 4) == 'HTTP')
+            $this->response->code = (int)substr($data, 9, 3);
+        else
+        {
+            $data = trim($data);
+            if (strpos($data, ': ') === false) return $strlen;
+            [$header, $value] = explode(': ', $data, 2);
+            $header = strtolower($header);
+            if ($header == 'last-modified')
+                $this->response->headers['time'] = strtotime($value);
+            elseif ($header == 'date')
+                $this->response->headers['date'] = strtotime($value);
+            elseif ($header == 'content-length')
+                $this->response->headers['size'] = (int)$value;
+            elseif ($header == 'content-type')
+                $this->response->headers['type'] = $value;
+            elseif ($header == 'etag')
+                $this->response->headers['hash'] = $value[0] == '"' ? substr($value, 1, -1) : $value;
+            elseif (preg_match('/^x-amz-meta-.*$/', $header))
+                $this->response->headers[$header] = $value;
+        }
+        return $strlen;
 	}
 
 }
